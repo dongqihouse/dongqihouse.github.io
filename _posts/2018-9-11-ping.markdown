@@ -1,0 +1,268 @@
+---
+layout:     post
+title:      "一个网络测试工具"
+subtitle:   " \" simplePing源码解析和完善\""
+date:       2018-09-11 18:00:00
+author:     "QD"
+header-img: "img/post-bg-2015.jpg"
+catalog: true
+tags:
+    - iOS
+---
+
+> 基本都是c 看的我十分难产
+
+## 使用
+``` swift
+let pinger = SimplePing(hostName: self.hostName)
+self.pinger = pinger
+pinger.delegate = self
+pinger.start()
+
+//然后代理回调
+func simplePing(pinger: SimplePing, didStartWithAddress address: NSData) {
+    self.pinger!.send(with: nil)
+}
+func simplePing(pinger: SimplePing, didReceivePingResponsePacket packet: NSData, sequenceNumber: UInt16) {
+    NSLog("#%u received, size=%zu", sequenceNumber, packet.length)
+}
+```
+
+## 总览
+
+对于网络测试我们知道ping命令，来测试网络连通性。苹果也给出了一个封装了一个简单的ping函数。我们去解读一下这个工具并去完善它。
+
+**总体流程**
+![ping 流程总览](/img/in-post/ping/ping-1.png)
+
+## 解析hostname
+
+**解析host流程图**
+![host 解析流程](/img/in-post/ping/ping-2.png)
+
+``` swift
+// 1 常见host
+self.host = (CFHostRef) CFAutorelease( CFHostCreateWithName(NULL, (__bridge CFStringRef) self.hostName) );
+assert(self.host != NULL);
+// 2 指定host 处理代理
+CFHostSetClient(self.host, HostResolveCallback, &context);
+
+CFHostScheduleWithRunLoop(self.host, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+//3 开始处理
+success = CFHostStartInfoResolution(self.host, kCFHostAddresses, &streamError);
+if ( ! success ) {
+[self didFailWithHostStreamError:streamError];
+}
+```
+这里要注意的是，`CFHostStartInfoResolution` 可以不用执行`client`和`runloop` 直接同步执行。这样会阻塞线程，直接将结果存放到`host` 实例中
+
+苹果这里有个`addressStyle` 的属性 让用户去指定ipv4还是ipv6 然后根据这个属性去处理host。这个处理感觉有点多余。
+
+```swift
+// ......
+addresses = (__bridge NSArray *) CFHostGetAddressing(self.host, &resolved);
+// ......
+const struct sockaddr * addrPtr;
+addrPtr = (const struct sockaddr *) address.bytes;
+```
+这里要注意一下
+`CFHostGetAddressing` 这个方法用来获取地址信息，获取的是是一个数组包含的`sockaddr`结构体
+```swift
+/*
+* [XSI] Structure used by kernel to store most addresses.
+*/
+struct sockaddr {
+__uint8_t    sa_len;        /* total length */
+sa_family_t    sa_family;    /* [XSI] address family */
+char        sa_data[14];    /* [XSI] addr value (actually larger) */
+};
+```
+这里有3个数据 长度 类型 以及 具体数据。 我们拿到这个 `sockaddr` 就知道目标主机的地址了。
+
+## 创建socket
+这里和host 差不多常见socket对象 然后放到runloop中
+```swift
+// Wrap it in a CFSocket and schedule it on the runloop.
+
+self.socket = (CFSocketRef) CFAutorelease( CFSocketCreateWithNative(NULL, fd, kCFSocketReadCallBack, SocketReadCallback, &context) );
+
+// The socket will now take care of cleaning up our file descriptor.
+rls = CFSocketCreateRunLoopSource(NULL, self.socket, 0);
+
+CFRunLoopAddSource(CFRunLoopGetCurrent(), rls, kCFRunLoopDefaultMode);
+```
+
+到现在 ---- `start` 的准备工作已经完成。 下面开始ping请求
+## 发送ping请求
+在解析源码之前，我们先要知道ping的原理
+> ICMP :互联网控制消息协议（英语：Internet Control Message Protocol，缩写：ICMP）是互联网协议族的核心协议之一。它用 于TCP/IP网络中发送控制消息，提供可能发生在通信环境中的各种问题反馈，通过这些信息，使管理者可以对所发生的问题作出 诊 断，然后采取适当的措施解决。
+> ICMP [1]依靠IP来完成它的任务，它是IP的主要部分。它与传输协议（如TCP和UDP）显著不同：它一般不用于在两点间传输数> 据。它通常不由网络程序直接使用，除了ping和traceroute这两个特别的例子。 IPv4中的ICMP被称作ICMPv4，IPv6中的ICMP则被称作ICMPv6。
+
+![报文结构](/img/in-post/ping/ping-3.png)
+
+这里源码中都定义
+```swift
+struct IPv4Header //ip头
+static uint16_t in_cksum(const void *buffer, size_t bufferLen) // 默认的校验方法
+
+struct ICMPHeader {
+uint8_t     type;
+uint8_t     code;
+uint16_t    checksum;
+uint16_t    identifier;
+uint16_t    sequenceNumber;
+// data...
+};
+
+enum {
+ICMPv4TypeEchoRequest = 8,          ///< The ICMP `type` for a ping request; in this case `code` is always 0.
+ICMPv4TypeEchoReply   = 0           ///< The ICMP `type` for a ping response; in this case `code` is always 0.
+};
+
+enum {
+ICMPv6TypeEchoRequest = 128,        ///< The ICMP `type` for a ping request; in this case `code` is always 0.
+ICMPv6TypeEchoReply   = 129         ///< The ICMP `type` for a ping response; in this case `code` is always 0.
+};
+
+```
+
+这边我们重点看的就是 icmp的包头结构 以及ipv4 ipv6 type的区别。
+
+发送ping请求是苹果放在源码 外面手动调用的 。这样可扩产性更高了，也更麻烦了😂
+
+```swift
+- (void)sendPingWithData:(NSData *)data 
+```
+
+**第一步**
+填充数据 这部分其实没啥用，就是更好识别自己的数据。如果没有这一步的话，系统应会自动帮我们填充到64bytes的
+```swift
+payload = data;
+if (payload == nil) {
+payload = [[NSString stringWithFormat:@"%28zd bottles of beer on the wall", (ssize_t) 99 - (size_t) (self.nextSequenceNumber % 100) ] dataUsingEncoding:NSASCIIStringEncoding];
+assert(payload != nil);
+
+// Our dummy payload is sized so that the resulting ICMP packet, including the ICMPHeader, is 
+// 64-bytes, which makes it easier to recognise our packets on the wire.
+
+assert([payload length] == 56);
+}
+```
+**第二步**
+组装数据
+```swift
+packet = [self pingPacketWithType:ICMPv4TypeEchoRequest payload:payload requiresChecksum:YES];
+.....
+
+
+NSMutableData *         packet;
+ICMPHeader *            icmpPtr;
+
+packet = [NSMutableData dataWithLength:sizeof(*icmpPtr) + payload.length];
+assert(packet != nil);
+
+icmpPtr = packet.mutableBytes;
+icmpPtr->type = type;
+icmpPtr->code = 0;
+icmpPtr->checksum = 0;
+icmpPtr->identifier     = OSSwapHostToBigInt16(self.identifier);
+icmpPtr->sequenceNumber = OSSwapHostToBigInt16(self.nextSequenceNumber);
+memcpy(&icmpPtr[1], [payload bytes], [payload length]);
+
+if (requiresChecksum) {
+// The IP checksum routine returns a 16-bit number that's already in correct byte order 
+// (due to wacky 1's complement maths), so we just put it into the packet as a 16-bit unit.
+
+icmpPtr->checksum = in_cksum(packet.bytes, packet.length);
+}
+
+```
+这一部分 要注意的是 ipv4 和 ipv6的校验值地方不一样。 ipv6 是不需要校验的， 后面验证数据也要区分
+
+**第三步**
+发送数据
+这一步 是同步 根据返回的结果来判断数据 回调发送成功还是失败
+```
+bytesSent = sendto(
+CFSocketGetNative(self.socket),
+packet.bytes,
+packet.length, 
+0,
+self.hostAddress.bytes, 
+(socklen_t) self.hostAddress.length
+);
+```
+
+**第四步**
+## 回调解析数据
+ ```swift
+- (void)readData {
+    .....
+    bytesRead = recvfrom(CFSocketGetNative(self.socket), buffer, kBufferSize, 0, (struct sockaddr *) &addr, &addrLen);
+    ....
+    packet = [NSMutableData dataWithBytes:buffer length:(NSUInteger) bytesRead];
+    ...
+    验证数据的正确性
+}
+```
+**第五步**
+校验数据
+```
+- (BOOL)validatePingResponsePacket:(NSMutableData *)packet sequenceNumber:(uint16_t *)sequenceNumberPtr 
+```
+这里校验 
+
+```swift
+//是否有icmp报文
+if (icmpHeaderOffset != NSNotFound) 
+    //判断校验和 ipv6不需要
+    if (receivedChecksum == calculatedChecksum) 
+        //报文中的返回是否是 返回类型
+        if ( (icmpPtr->type == ICMPv4TypeEchoReply)
+            //发送的Sequence 是否匹配
+            if ([self validateSequenceNumber:sequenceNumber])
+```
+
+中间穿插的代理回调。
+大体的ping 的流程就很清楚了。 主要是CF层的API 真的超级难用。
+
+## 拓展 traceroute
+
+![tracetoute](/img/in-post/ping/ping-4.png)
+
+> TTL（time-to-live）是IP数据包中的一个字段，它指定了数据包最多能经过几次路由器。从我们源主机发出去的数据包在到达目的主机的路上要经过许多个路由器的转发，在发送数据包的时候源主机会设置一个TTL的值，每经过一个路由器TTL就会被减去一，当TTL为0的时候该数据包会被直接丢弃（不再继续转发），并发送一个超时ICMP报文给源主机。
+
+
+差不多和ping 不同的是
+
+第一
+    在ip报文段中添加ttl
+```swift
+setsockopt(CFSocketGetNative(self.socket), IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+```
+第二
+   发送3次icmp
+```swift
+sendto
+sendto
+sendto
+```
+## 封装好了工具
+[QDNetDiagnostics!](https://github.com/dongqihouse/QDNetDiagnostics)
+
+## Usage
+
+```swift
+self.netDiagnostics = [[QDNetDiagnostics alloc] initWithHostName:@"wwww.baidu.com"];
+[self.netDiagnostics startDiagnosticAndNetInfo:^(NSString *info) {
+NSLog(@"%@",info);
+}];
+```
+
+## Result
+![tracetoute](/img/in-post/ping/ping-5.png)
+
+
+
+
+
