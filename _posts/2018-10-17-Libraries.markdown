@@ -4,7 +4,7 @@ title:      "静态库和动态库的一些记录"
 subtitle:   " \"静态库和动态库的一些讨论\""
 date:       2018-10-17 17:00:00
 author:     "QD"
-header-img: "img/in-post/Libraries/static_library.png"
+header-img: "/img/in-post/Libraries/static_library.png"
 catalog: true
 tags:
     - 其它

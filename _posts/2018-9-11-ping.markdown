@@ -4,7 +4,7 @@ title:      "一个网络测试工具"
 subtitle:   " \" simplePing源码解析和完善\""
 date:       2018-09-11 18:00:00
 author:     "QD"
-header-img: "img/post-bg-2015.jpg"
+header-img: "/img/post-bg-2015.jpg"
 catalog: true
 tags:
     - iOS

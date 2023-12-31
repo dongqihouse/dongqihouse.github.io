@@ -4,7 +4,7 @@ title:      "关于下载的一些记录"
 subtitle:   " \" URLSession \""
 date:       2018-10-7 16:00:00
 author:     "QD"
-header-img: "img/post-bg-2015.jpg"
+header-img: "/img/post-bg-2015.jpg"
 catalog: true
 tags:
     - iOS
